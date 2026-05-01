@@ -1,10 +1,9 @@
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional
 
-# Важливо: python-telegram-bot використовує назву 'telegram' для імпорту
 from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -19,10 +18,10 @@ from telegram.ext import (
 BOT_TOKEN = "8330028687:AAEU9Qah_ykkUgA32Dw2ev9x1NVkNplrvs8"
 DATA_FILE = "data.json"
 MAX_PLAYERS = 7
-REMINDER_HOURS_BEFORE = 2
 
 FIXED_COACH_ID = 7908057052  # ID тренера
 
+# Состояния для диалогов
 PROFILE_NAME = 0
 MATCH_DATE, MATCH_TIME, MATCH_LOCATION = range(1, 4)
 
@@ -52,179 +51,232 @@ def save_data(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def is_coach(user_id: int, data: dict) -> bool:
-    if FIXED_COACH_ID is not None:
-        return user_id == FIXED_COACH_ID
-    return data["team"]["coach"] == user_id
-
-def get_team_display(data: dict) -> str:
-    team = data["team"]["players"]
-    players = data["players"]
-    if not team:
-        return "Состав команды пуст."
-    lines = []
-    for idx, uid in enumerate(team, 1):
-        p = players.get(str(uid), {})
-        name = p.get("name", "Неизвестный")
-        pos = p.get("position", "?")
-        lines.append(f"{idx}. {name} – {pos}")
-    return "🧑‍🤝‍🧑 Текущий состав:\n" + "\n".join(lines)
-
-def get_future_matches(data: dict) -> List[dict]:
-    now = datetime.now()
-    future = []
-    for m in data.get("matches", []):
-        try:
-            if datetime.fromisoformat(m["datetime"]) > now:
-                future.append(m)
-        except:
-            continue
-    future.sort(key=lambda m: m["datetime"])
-    return future
-
-def format_match(match: dict) -> str:
-    dt = datetime.fromisoformat(match["datetime"]).strftime("%d.%m.%Y %H:%M")
-    return f"📅 {dt}\n📍 {match['location']}"
-
-def find_player_by_name(data: dict, name: str) -> Optional[str]:
-    for uid, p in data["players"].items():
-        if p.get("name") == name:
-            return uid
-    return None
+    return user_id == FIXED_COACH_ID
 
 # ==================== КОМАНДЫ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "⚽️ Бот мини-футбольной команды\n\n"
-        "Команды:\n"
-        "/profile — создать/посмотреть профиль\n"
-        "/team — состав команды\n"
-        "/matches — список будущих матчей\n\n"
-        "Тренер:\n"
-        "/add_player @user — добавить игрока\n"
+        "⚽️ Бот управления командой\n\n"
+        "Команды для всех:\n"
+        "/profile — создать свой профиль\n"
+        "/team — посмотреть состав\n"
+        "/matches — расписание матчей\n\n"
+        "Команды для тренера:\n"
+        "/add_player @user — добавить игрока по нику\n"
         "/add_player Имя Позиция — добавить вручную\n"
-        "/setplayer @name Позиция — изменить позицию\n"
-        "/match — создать матч\n"
-        f"Позиции: {', '.join(POSITIONS)}"
+        "/delete_player — удалить игрока из состава\n"
+        "/match — создать новый матч\n"
+        "/cancel — отмена любого процесса ввода"
     )
     await update.message.reply_text(help_text)
 
+# -------------------- УПРАВЛЕНИЕ СОСТАВОМ --------------------
+async def team(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    team_list = data["team"]["players"]
+    players = data["players"]
+    
+    if not team_list:
+        await update.message.reply_text("Состав пуст.")
+        return
+
+    lines = ["🧑‍🤝‍🧑 **Текущий состав:**"]
+    for idx, uid in enumerate(team_list, 1):
+        p = players.get(str(uid), {})
+        name = p.get("name", "Неизвестный")
+        pos = p.get("position", "Позиция не задана")
+        lines.append(f"{idx}. {name} — {pos}")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data()
+    
+    if not is_coach(user_id, data):
+        await update.message.reply_text("❌ Только тренер может добавлять игроков.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование:\n/add_player @username\n/add_player Имя Позиция")
+        return
+
+    if len(data["team"]["players"]) >= MAX_PLAYERS:
+        await update.message.reply_text(f"Лимит {MAX_PLAYERS} игроков исчерпан.")
+        return
+
+    arg = context.args[0]
+    if arg.startswith("@"):
+        username = arg.lstrip("@")
+        target_id = None
+        for uid, p in data["players"].items():
+            if p.get("contact") == username:
+                target_id = uid
+                break
+        
+        if not target_id:
+            await update.message.reply_text("Игрок не найден. Он должен сначала нажать /profile")
+            return
+        
+        if target_id in data["team"]["players"] or (target_id.isdigit() and int(target_id) in data["team"]["players"]):
+            await update.message.reply_text("Игрок уже в составе.")
+            return
+
+        uid_to_add = int(target_id) if target_id.isdigit() else target_id
+        data["team"]["players"].append(uid_to_add)
+        save_data(data)
+        await update.message.reply_text(f"✅ @{username} добавлен в состав.")
+    else:
+        if len(context.args) < 2:
+            await update.message.reply_text("Укажите позицию. Пример: /add_player Иван Вратарь")
+            return
+        
+        name = context.args[0]
+        pos = " ".join(context.args[1:])
+        manual_id = f"manual_{uuid.uuid4().hex[:8]}"
+        
+        data["players"][manual_id] = {"name": name, "position": pos, "contact": None}
+        data["team"]["players"].append(manual_id)
+        save_data(data)
+        await update.message.reply_text(f"✅ Игрок {name} добавлен вручную.")
+
+async def delete_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data()
+    
+    if not is_coach(user_id, data):
+        await update.message.reply_text("❌ Только тренер может удалять игроков.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Введите номер игрока из списка /team.\nПример: /delete_player 1")
+        return
+
+    try:
+        idx = int(context.args[0]) - 1
+        if 0 <= idx < len(data["team"]["players"]):
+            removed_id = data["team"]["players"].pop(idx)
+            save_data(data)
+            await update.message.reply_text("✅ Игрок удален из состава.")
+        else:
+            await update.message.reply_text("Неверный номер.")
+    except ValueError:
+        await update.message.reply_text("Введите число (номер игрока).")
+
+# -------------------- ПРОФИЛЬ --------------------
 async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
-    user_id = update.effective_user.id
-    if str(user_id) in data["players"]:
-        p = data["players"][str(user_id)]
-        text = f"Ваш профиль:\nИмя: {p['name']}\nПозиция: {p.get('position') or 'не назначена'}\nКонтакт: @{p['contact']}"
-        await update.message.reply_text(text)
+    user_id = str(update.effective_user.id)
+    if user_id in data["players"]:
+        p = data["players"][user_id]
+        await update.message.reply_text(f"Ваш профиль:\nИмя: {p['name']}\nКонтакт: @{p['contact']}")
         return ConversationHandler.END
-    await update.message.reply_text("Введите ваше имя:")
+    await update.message.reply_text("Введите ваше имя для профиля:")
     return PROFILE_NAME
 
 async def profile_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     user = update.effective_user
     data = load_data()
-    data["players"][str(user.id)] = {"name": name, "position": None, "contact": user.username or f"id{user.id}"}
+    data["players"][str(user.id)] = {
+        "name": name, 
+        "position": None, 
+        "contact": user.username or f"id{user.id}"
+    }
     save_data(data)
-    await update.message.reply_text("✅ Профиль сохранён!", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(f"✅ Профиль {name} создан!")
     return ConversationHandler.END
 
-async def add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    data = load_data()
-    if not is_coach(user_id, data):
-        await update.message.reply_text("❌ Доступ только для тренера.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Пример: /add_player @username або /add_player Имя Позиция")
-        return
-
-    # Логика добавления...
-    arg = context.args[0]
-    if arg.startswith("@"):
-        username = arg.lstrip("@")
-        target_id = next((uid for uid, p in data["players"].items() if p.get("contact") == username), None)
-        if not target_id:
-            await update.message.reply_text("Игрок не найден. Пусть он нажмет /profile")
-            return
-        if int(target_id) not in data["team"]["players"]:
-            data["team"]["players"].append(int(target_id))
-            save_data(data)
-            await update.message.reply_text(f"✅ @{username} добавлен в команду.")
-    else:
-        # Ручное добавление
-        if len(context.args) < 2: return
-        name, pos = context.args[0], " ".join(context.args[1:])
-        new_id = f"manual_{uuid.uuid4().hex[:8]}"
-        data["players"][new_id] = {"name": name, "position": pos, "contact": None}
-        data["team"]["players"].append(new_id)
-        save_data(data)
-        await update.message.reply_text(f"✅ {name} добавлен!")
-
-async def team(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(get_team_display(load_data()))
-
-async def matches_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    future = get_future_matches(load_data())
-    if not future:
-        await update.message.reply_text("Нет матчей.")
-        return
-    text = "📋 Матчи:\n" + "\n".join([format_match(m) for m in future])
-    await update.message.reply_text(text)
-
+# -------------------- МАТЧИ --------------------
 async def match_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_coach(update.effective_user.id, load_data()): return ConversationHandler.END
-    await update.message.reply_text("Дата (ДД.ММ.ГГГГ):")
+    if not is_coach(update.effective_user.id, load_data()):
+        await update.message.reply_text("❌ Только тренер создает матчи.")
+        return ConversationHandler.END
+    await update.message.reply_text("Введите дату матча (например, 15.05.2026):")
     return MATCH_DATE
 
 async def match_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["m_date"] = update.message.text
-    await update.message.reply_text("Время (ЧЧ:ММ):")
+    context.user_data["m_date"] = update.message.text.strip()
+    await update.message.reply_text("Введите время (например, 19:00):")
     return MATCH_TIME
 
 async def match_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["m_time"] = update.message.text
-    await update.message.reply_text("Место:")
+    context.user_data["m_time"] = update.message.text.strip()
+    await update.message.reply_text("Введите место проведения:")
     return MATCH_LOCATION
 
 async def match_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
-    dt_str = f"{context.user_data['m_date']} {context.user_data['m_time']}"
+    m_date = context.user_data.get("m_date")
+    m_time = context.user_data.get("m_time")
+    m_loc = update.message.text.strip()
+    
     try:
+        dt_str = f"{m_date} {m_time}"
         dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
-        data["matches"].append({"datetime": dt.isoformat(), "location": update.message.text})
+        data["matches"].append({"datetime": dt.isoformat(), "location": m_loc})
         save_data(data)
-        await update.message.reply_text("✅ Матч создан!")
-    except:
-        await update.message.reply_text("Ошибка в дате.")
+        await update.message.reply_text(f"✅ Матч создан!\n📅 {m_date} в {m_time}\n📍 {m_loc}")
+    except Exception as e:
+        await update.message.reply_text("Ошибка в формате даты или времени. Используйте ДД.ММ.ГГГГ и ЧЧ:ММ")
+    
+    context.user_data.clear()
     return ConversationHandler.END
 
+async def matches_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    now = datetime.now()
+    future = [m for m in data.get("matches", []) if datetime.fromisoformat(m["datetime"]) > now]
+    
+    if not future:
+        await update.message.reply_text("Нет предстоящих матчей.")
+        return
+
+    lines = ["📋 **Ближайшие матчи:**"]
+    for m in sorted(future, key=lambda x: x["datetime"]):
+        dt = datetime.fromisoformat(m["datetime"]).strftime("%d.%m.%Y %H:%M")
+        lines.append(f"• {dt} — {m['location']}")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+# ==================== ЗАПУСК ====================
 def main():
     logging.basicConfig(level=logging.INFO)
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("team", team))
-    app.add_handler(CommandHandler("matches", matches_list))
-    app.add_handler(CommandHandler("add_player", add_player))
-    
-    app.add_handler(ConversationHandler(
+    # Сценарий профиля
+    profile_conv = ConversationHandler(
         entry_points=[CommandHandler("profile", profile_start)],
         states={PROFILE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_name)]},
-        fallbacks=[]
-    ))
-    
-    app.add_handler(ConversationHandler(
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+
+    # Сценарий матча
+    match_conv = ConversationHandler(
         entry_points=[CommandHandler("match", match_start)],
         states={
             MATCH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_date)],
             MATCH_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_time)],
             MATCH_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_location)],
         },
-        fallbacks=[]
-    ))
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
 
-    print("🚀 Запуск...")
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(profile_conv)
+    app.add_handler(match_conv)
+    app.add_handler(CommandHandler("team", team))
+    app.add_handler(CommandHandler("add_player", add_player))
+    app.add_handler(CommandHandler("delete_player", delete_player))
+    app.add_handler(CommandHandler("matches", matches_list))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    print("🚀 Бот запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
