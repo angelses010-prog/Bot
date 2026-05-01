@@ -17,7 +17,7 @@ from telegram.ext import (
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = "8330028687:AAEU9Qah_ykkUgA32Dw2ev9x1NVkNplrvs8"
 DATA_FILE = "data.json"
-MAX_PLAYERS = 7
+MAX_PLAYERS = 30
 
 FIXED_COACH_ID = 7908057052  # ID тренера
 
