@@ -1,196 +1,159 @@
+import asyncio
 import logging
-import sqlite3
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
-# --- КОНФИГУРАЦИЯ ---
-TOKEN = '8330028687:AAEU9Qah_ykkUgA32Dw2ev9x1NVkNplrvs8'
-ADMINS = [5274130061, 7908057052]
+# Твои данные
+API_TOKEN = '8067572893:AAH0Lx_Dq2lENkuTDoHQO1v46NTe8WLWEpo'
+ADMIN_ID = 7908057052
 
-# Настройка логирования
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
 
-# --- БАЗА ДАННЫХ ---
-def init_db():
-    conn = sqlite3.connect('football_manager.db')
-    cursor = conn.cursor()
-    # Таблица пользователей
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                      (user_id INTEGER PRIMARY KEY, username TEXT, club_name TEXT, budget INTEGER, reg_date TEXT)''')
-    # Таблица игроков
-    cursor.execute('''CREATE TABLE IF NOT EXISTS players 
-                      (player_id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, name TEXT, 
-                       position TEXT, age INTEGER, salary INTEGER, status TEXT, last_retired TEXT)''')
-    
-    # Наполняем рынок, если он пуст
-    cursor.execute("SELECT COUNT(*) FROM players")
-    if cursor.fetchone()[0] == 0:
-        market_players = [
-            (0, 'Криштиану Роналду', 'Нападающий', 39, 900000, 'free'),
-            (0, 'Килиан Мбаппе', 'Нападающий', 25, 1500000, 'free'),
-            (0, 'Джуд Беллингем', 'Полузащитник', 20, 1100000, 'free'),
-            (0, 'Винисиус Жуниор', 'Нападающий', 23, 1300000, 'free'),
-            (0, 'Ламин Ямаль', 'Вингер', 16, 700000, 'free')
-        ]
-        cursor.executemany("INSERT INTO players (owner_id, name, position, age, salary, status) VALUES (?,?,?,?,?,?)", market_players)
-    
-    conn.commit()
-    conn.close()
+# Состояния для создания матча
+class MatchSetup(StatesGroup):
+    choosing_team1 = State()
+    choosing_team2 = State()
+    setting_time = State()
 
-# --- СОСТОЯНИЯ РЕГИСТРАЦИИ ---
-CLUB_NAME = 1
+# База данных в памяти
+db = {
+    "players": {}, 
+    "clubs": []  # Сюда добавляются команды через /add_club
+}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conn = sqlite3.connect('football_manager.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT club_name, budget FROM users WHERE user_id = ?", (user_id,))
-    user = cursor.fetchone()
-    conn.close()
+# --- Клавиатуры ---
 
-    if user:
-        await update.message.reply_text(
-            f"🏟 **Клуб:** «{user[0]}»\n💰 **Бюджет:** {user[1]:,} €\n\n"
-            "**Управление:**\n"
-            "/my_players — Состав клуба\n"
-            "/free_agents — Рынок игроков\n"
-            "/admin_money — Получить 50 млн (только для админов)"
-        )
-        return ConversationHandler.END
+def get_player_kb():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="/Ready")
+    kb.button(text="/UnReady")
+    kb.adjust(2)
+    return kb.as_markup(resize_keyboard=True)
+
+def get_clubs_keyboard():
+    builder = InlineKeyboardBuilder()
+    for club in db["clubs"]:
+        builder.button(text=club, callback_data=f"select_club:{club}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# --- Хендлеры игроков ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in db["players"]:
+        club = db["players"][user_id]["club"]
+        await message.answer(f"✅ Вы в клубе: **{club}**", reply_markup=get_player_kb(), parse_mode="Markdown")
     else:
-        await update.message.reply_text("⚽ Добро пожаловать! Как будет называться ваш клуб?")
-        return CLUB_NAME
+        await message.answer("❌ Вы не привязаны. Попросите @Verybigsun привязать вас.")
 
-async def register_club(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    club_name = update.message.text
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Тренер"
-    
-    conn = sqlite3.connect('football_manager.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?)", 
-                   (user_id, username, club_name, 100000000, datetime.now().strftime("%Y-%m-%d")))
-    conn.commit()
-    conn.close()
-    
-    await update.message.reply_text(f"✅ Клуб «{club_name}» успешно создан!\nНапишите /start, чтобы открыть меню.")
-    return ConversationHandler.END
+@dp.message(Command("Ready"))
+async def cmd_ready(message: types.Message):
+    if message.from_user.id not in db["players"]: return
+    await message.answer("✅ Ты подтвердил участие!")
+    await bot.send_message(ADMIN_ID, f"🟢 **ГОТОВ**: {message.from_user.full_name} ({db['players'][message.from_user.id]['club']})")
 
-# --- ФУНКЦИИ ИГРОКОВ ---
+@dp.message(Command("UnReady"))
+async def cmd_unready(message: types.Message):
+    if message.from_user.id not in db["players"]: return
+    await message.answer("❌ Записал, что тебя не будет.")
+    await bot.send_message(ADMIN_ID, f"🔴 **ОТКАЗ**: {message.from_user.full_name} ({db['players'][message.from_user.id]['club']})")
 
-async def free_agents(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect('football_manager.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT player_id, name, position, salary FROM players WHERE status = 'free'")
-    players = cursor.fetchall()
-    conn.close()
+# --- Админ-панель: Создание матча ---
 
-    if not players:
-        await update.message.reply_text("На рынке сейчас нет игроков.")
-        return
-
-    keyboard = [[InlineKeyboardButton(f"✍️ {p[1]} | {p[3]:,} €", callback_data=f"sign_{p[0]}")] for p in players]
-    await update.message.reply_text("📋 Свободные агенты:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def my_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conn = sqlite3.connect('football_manager.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT player_id, name, position FROM players WHERE owner_id = ? AND status = 'active'", (user_id,))
-    players = cursor.fetchall()
-    conn.close()
-
-    if not players:
-        await update.message.reply_text("В вашем клубе пока нет игроков. Купите их в /free_agents")
-        return
-
-    keyboard = [[InlineKeyboardButton(f"👞 Завершить карьеру: {p[1]}", callback_data=f"retire_{p[0]}")] for p in players]
-    await update.message.reply_text("🏃 Ваш текущий состав:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-# --- ОБРАБОТКА CALLBACK ---
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    user_id = query.from_user.id
-    
-    conn = sqlite3.connect('football_manager.db')
-    cursor = conn.cursor()
-
-    if data.startswith("sign_"):
-        p_id = data.split("_")[1]
-        cursor.execute("SELECT budget FROM users WHERE user_id = ?", (user_id,))
-        res = cursor.fetchone()
-        if not res: return
-        
-        budget = res[0]
-        cursor.execute("SELECT name, salary FROM players WHERE player_id = ?", (p_id,))
-        p_name, p_salary = cursor.fetchone()
-
-        if budget >= p_salary:
-            cursor.execute("UPDATE users SET budget = budget - ? WHERE user_id = ?", (p_salary, user_id))
-            cursor.execute("UPDATE players SET owner_id = ?, status = 'active' WHERE player_id = ?", (user_id, p_id))
-            conn.commit()
-            await query.edit_message_text(f"🤝 Контракт подписан! {p_name} перешел в ваш клуб.")
-        else:
-            await query.answer("❌ Недостаточно средств!", show_alert=True)
-
-    elif data.startswith("retire_"):
-        p_id = data.split("_")[1]
-        now = datetime.now()
-        cursor.execute("SELECT name, last_retired FROM players WHERE player_id = ?", (p_id,))
-        p_name, last_ret = cursor.fetchone()
-
-        # Проверка КД 7 дней
-        if last_ret:
-            last_date = datetime.strptime(last_ret, "%Y-%m-%d %H:%M:%S")
-            if now < last_date + timedelta(days=7):
-                await query.answer("⏳ Нельзя завершать карьеру чаще, чем раз в неделю!", show_alert=True)
-                conn.close()
-                return
-
-        cursor.execute("UPDATE players SET status = 'retired', owner_id = 0, last_retired = ? WHERE player_id = ?", 
-                       (now.strftime("%Y-%m-%d %H:%M:%S"), p_id))
-        conn.commit()
-        await query.edit_message_text(f"👞 {p_name} завершил профессиональную карьеру.")
-
-    conn.close()
-
-# --- АДМИН-КОМАНДА ---
-async def admin_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
-        await update.message.reply_text("⛔ Эта команда доступна только администраторам.")
-        return
-        
-    conn = sqlite3.connect('football_manager.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET budget = budget + 50000000 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("💰 Читы сработали! +50.000.000 € зачислено.")
-
-# --- ЗАПУСК ---
-def main():
-    init_db()
-    application = Application.builder().token(TOKEN).build()
-
-    # Обработчик регистрации
-    reg_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={CLUB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_club)]},
-        fallbacks=[]
+@dp.message(Command("Admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer(
+        "🛠 **Админка**\n\n"
+        "1. `/add_club Название` — Добавить команду в список\n"
+        "2. `/bind ID Название` — Привязать игрока к клубу\n"
+        "3. `/match` — Создать новый сбор на игру", 
+        parse_mode="Markdown"
     )
 
-    application.add_handler(reg_handler)
-    application.add_handler(CommandHandler('free_agents', free_agents))
-    application.add_handler(CommandHandler('my_players', my_players))
-    application.add_handler(CommandHandler('admin_money', admin_money))
-    application.add_handler(CallbackQueryHandler(handle_callback))
+@dp.message(Command("add_club"))
+async def add_club(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    club_name = message.text.replace("/add_club ", "").strip()
+    if club_name and club_name not in db["clubs"]:
+        db["clubs"].append(club_name)
+        await message.answer(f"✅ Команда **{club_name}** добавлена.")
+    else:
+        await message.answer("Введите название или такая команда уже есть.")
 
-    print("✅ Бот запущен! Ожидание сообщений...")
-    application.run_polling()
+@dp.message(Command("match"))
+async def start_match_creation(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    if not db["clubs"]:
+        return await message.answer("Сначала добавьте команды через `/add_club`")
+    
+    await state.set_state(MatchSetup.choosing_team1)
+    await message.answer("Выбери **Первую команду**:", reply_markup=get_clubs_keyboard())
 
-if __name__ == '__main__':
-    main()
+@dp.callback_query(MatchSetup.choosing_team1)
+async def team1_chosen(callback: types.CallbackQuery, state: FSMContext):
+    club = callback.data.split(":")[1]
+    await state.update_data(team1=club)
+    await state.set_state(MatchSetup.choosing_team2)
+    await callback.message.edit_text(f"Выбрано: {club}\nТеперь выбери **Вторую команду**:", reply_markup=get_clubs_keyboard())
+
+@dp.callback_query(MatchSetup.choosing_team2)
+async def team2_chosen(callback: types.CallbackQuery, state: FSMContext):
+    club = callback.data.split(":")[1]
+    data = await state.get_data()
+    if club == data['team1']:
+        return await callback.answer("Выбери другую команду, нельзя играть с самим собой!")
+    
+    await state.update_data(team2=club)
+    await state.set_state(MatchSetup.setting_time)
+    await callback.message.edit_text(f"Матч: {data['team1']} vs {club}\n\nНапиши **дату и время** матча (например: 20 мая в 18:00):")
+
+@dp.message(MatchSetup.setting_time)
+async def finish_match_creation(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    time_str = message.text
+    data = await state.get_data()
+    await state.clear()
+
+    match_text = (
+        f"📢 **НОВЫЙ МАТЧ!**\n\n"
+        f"🏟 **{data['team1']}** vs **{data['team2']}**\n"
+        f"⏰ Время: **{time_str}**\n\n"
+        f"Просьба всем игрокам дать отпись кнопками /Ready или /UnReady!"
+    )
+
+    # Рассылка всем привязанным игрокам
+    sent_count = 0
+    for user_id in db["players"]:
+        try:
+            await bot.send_message(user_id, match_text, parse_mode="Markdown")
+            sent_count += 1
+        except:
+            pass
+    
+    await message.answer(f"✅ Сбор разослан {sent_count} игрокам!")
+
+@dp.message(Command("bind"))
+async def bind_player(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        parts = message.text.split(maxsplit=2)
+        target_id, club_name = int(parts[1]), parts[2]
+        db["players"][target_id] = {"club": club_name}
+        await message.answer(f"✅ Игрок {target_id} привязан к {club_name}")
+        await bot.send_message(target_id, f"🎉 Вы привязаны к клубу **{club_name}**!")
+    except:
+        await message.answer("Ошибка. Формат: `/bind ID Название`")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
