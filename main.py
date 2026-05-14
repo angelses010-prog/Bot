@@ -1,23 +1,28 @@
-import asyncio
 import logging
 import json
 import os
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQuery_Handler,
+    ConversationHandler,
+    ContextTypes,
+    filters
+)
 
 # --- НАСТРОЙКИ ---
-API_TOKEN = '8067572893:AAH0Lx_Dq2lENkuTDoHQO1v46NTe8WLWEpo'
+TOKEN = '8067572893:AAH0Lx_Dq2lENkuTDoHQO1v46NTe8WLWEpo'
 ADMIN_ID = 7908057052
 DB_FILE = 'database.json'
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+# Этапы создания матча (для ConversationHandler)
+TEAM1, TEAM2, TIME = range(3)
 
-# --- ЛОГИКА БАЗЫ ДАННЫХ (JSON) ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# --- БАЗА ДАННЫХ ---
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, 'r', encoding='utf-8') as f:
@@ -30,135 +35,135 @@ def save_db(data):
 
 db = load_db()
 
-# --- СОСТОЯНИЯ ДЛЯ МАШИНЫ СОСТОЯНИЙ (FSM) ---
-class MatchSetup(StatesGroup):
-    choosing_team1 = State()
-    choosing_team2 = State()
-    setting_time = State()
-
-# --- КЛАВИАТУРЫ ---
-def get_player_kb():
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="/Ready")
-    kb.button(text="/UnReady")
-    kb.adjust(2)
-    return kb.as_markup(resize_keyboard=True)
-
-def get_clubs_keyboard():
-    builder = InlineKeyboardBuilder()
-    for club in db["clubs"]:
-        builder.button(text=club, callback_data=f"sel:{club}")
-    builder.adjust(1)
-    return builder.as_markup()
-
 # --- ХЕНДЛЕРЫ ИГРОКОВ ---
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    user_id = str(message.from_user.id)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
     if user_id in db["players"]:
         club = db["players"][user_id]["club"]
-        await message.answer(f"✅ Вы привязаны к клубу: **{club}**", reply_markup=get_player_kb(), parse_mode="Markdown")
+        reply_kb = [['/Ready', '/UnReady']]
+        await update.message.reply_text(
+            f"✅ Вы привязаны к клубу: {club}",
+            reply_markup=ReplyKeyboardMarkup(reply_kb, resize_keyboard=True)
+        )
     else:
-        await message.answer("❌ Вы не привязаны к клубу. Попросите @Verybigsun привязать вас.")
+        await update.message.reply_text("❌ Вы не привязаны. Попросите @Verybigsun привязать вас.")
 
-@dp.message(Command("Ready"))
-async def cmd_ready(message: types.Message):
-    user_id = str(message.from_user.id)
+async def ready(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
     if user_id not in db["players"]: return
-    await message.answer("✅ Ты подтвердил участие!")
-    await bot.send_message(ADMIN_ID, f"🟢 **ГОТОВ**: {message.from_user.full_name} (@{message.from_user.username or 'no_nick'}) — {db['players'][user_id]['club']}")
+    name = update.effective_user.full_name
+    club = db["players"][user_id]["club"]
+    await update.message.reply_text("✅ Принято!")
+    await context.bot.send_message(ADMIN_ID, f"🟢 ГОТОВ: {name} ({club})")
 
-@dp.message(Command("UnReady"))
-async def cmd_unready(message: types.Message):
-    user_id = str(message.from_user.id)
+async def unready(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
     if user_id not in db["players"]: return
-    await message.answer("❌ Записал, что тебя не будет.")
-    await bot.send_message(ADMIN_ID, f"🔴 **ОТКАЗ**: {message.from_user.full_name} (@{message.from_user.username or 'no_nick'}) — {db['players'][user_id]['club']}")
+    name = update.effective_user.full_name
+    club = db["players"][user_id]["club"]
+    await update.message.reply_text("❌ Отметил, что вас не будет.")
+    await context.bot.send_message(ADMIN_ID, f"🔴 ОТКАЗ: {name} ({club})")
 
-# --- АДМИН-КОМАНДЫ ---
-@dp.message(Command("Admin"))
-async def cmd_admin(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer(
-        "🛠 **Панель админа**\n\n"
-        "1️⃣ `/add_club Название` — Добавить команду\n"
-        "2️⃣ `/bind ID Название` — Привязать игрока\n"
-        "3️⃣ `/match` — Создать сбор на игру",
-        parse_mode="Markdown"
+# --- АДМИН КОМАНДЫ ---
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    await update.message.reply_text(
+        "🛠 Админка:\n"
+        "/add_club [Название] — добавить клуб\n"
+        "/bind [ID] [Название] — привязать игрока\n"
+        "/match — создать сбор"
     )
 
-@dp.message(Command("add_club"))
-async def add_club(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    name = message.text.replace("/add_club ", "").strip()
-    if name and name not in db["clubs"]:
-        db["clubs"].append(name)
-        save_db(db)
-        await message.answer(f"✅ Команда **{name}** добавлена.")
+async def add_club(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    club_name = " ".join(context.args)
+    if club_name:
+        if club_name not in db["clubs"]:
+            db["clubs"].append(club_name)
+            save_db(db)
+            await update.message.reply_text(f"✅ Клуб {club_name} добавлен.")
+    else:
+        await update.message.reply_text("Напишите название: /add_club Динамо")
 
-@dp.message(Command("bind"))
-async def bind_player(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
+async def bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
     try:
-        parts = message.text.split(maxsplit=2)
-        target_id, club_name = parts[1], parts[2]
-        db["players"][target_id] = {"club": club_name, "name": "Unknown"}
+        t_id = context.args[0]
+        c_name = " ".join(context.args[1:])
+        db["players"][t_id] = {"club": c_name}
         save_db(db)
-        await message.answer(f"✅ Игрок {target_id} привязан к {club_name}")
-        try:
-            await bot.send_message(int(target_id), f"🎉 Тебя привязали к клубу **{club_name}**!")
-        except: pass
+        await update.message.reply_text(f"✅ Игрок {t_id} привязан к {c_name}")
     except:
-        await message.answer("Ошибка! Формат: `/bind 12345678 НазваниеКоманды`")
+        await update.message.reply_text("Ошибка. Формат: /bind 12345 Название")
 
-# --- ПРОЦЕСС СОЗДАНИЯ МАТЧА ---
-@dp.message(Command("match"))
-async def start_match(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+# --- ЛОГИКА СОЗДАНИЯ МАТЧА ---
+async def match_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
     if not db["clubs"]:
-        return await message.answer("Сначала добавь команды: `/add_club Название`")
-    await state.set_state(MatchSetup.choosing_team1)
-    await message.answer("Выбери **Первую команду**:", reply_markup=get_clubs_keyboard())
+        await update.message.reply_text("Сначала добавьте клубы.")
+        return ConversationHandler.END
+    
+    kb = [[InlineKeyboardButton(c, callback_data=c)] for c in db["clubs"]]
+    await update.message.reply_text("Выберите первую команду:", reply_markup=InlineKeyboardMarkup(kb))
+    return TEAM1
 
-@dp.callback_query(F.data.startswith("sel:"), MatchSetup.choosing_team1)
-async def t1_selected(callback: types.CallbackQuery, state: FSMContext):
-    club = callback.data.split(":")[1]
-    await state.update_data(t1=club)
-    await state.set_state(MatchSetup.choosing_team2)
-    await callback.message.edit_text(f"Команда 1: {club}\nВыбери **Вторую команду**:", reply_markup=get_clubs_keyboard())
+async def team1_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['t1'] = query.data
+    kb = [[InlineKeyboardButton(c, callback_data=c)] for c in db["clubs"]]
+    await query.edit_message_text(f"Команда 1: {query.data}\nВыберите соперника:", reply_markup=InlineKeyboardMarkup(kb))
+    return TEAM2
 
-@dp.callback_query(F.data.startswith("sel:"), MatchSetup.choosing_team2)
-async def t2_selected(callback: types.CallbackQuery, state: FSMContext):
-    club = callback.data.split(":")[1]
-    data = await state.get_data()
-    if club == data['t1']:
-        return await callback.answer("Нельзя выбрать ту же команду!")
-    await state.update_data(t2=club)
-    await state.set_state(MatchSetup.setting_time)
-    await callback.message.edit_text(f"Матч: {data['t1']} vs {club}\n\nВведи дату и время (текстом):")
+async def team2_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == context.user_data['t1']:
+        await query.message.reply_text("Нельзя выбрать ту же команду.")
+        return TEAM2
+    context.user_data['t2'] = query.data
+    await query.edit_message_text(f"Матч: {context.user_data['t1']} vs {query.data}\nНапишите время и дату:")
+    return TIME
 
-@dp.message(MatchSetup.setting_time)
-async def set_time(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
-    time_val = message.text
-    data = await state.get_data()
-    await state.clear()
-
-    msg = (f"📢 **НОВЫЙ МАТЧ!**\n\n🏟 **{data['t1']}** vs **{data['t2']}**\n"
-           f"⏰ Время: **{time_val}**\n\n"
-           f"Жми /Ready если будешь, или /UnReady если нет!")
-
-    count = 0
+async def time_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    time_val = update.message.text
+    t1 = context.user_data['t1']
+    t2 = context.user_data['t2']
+    
+    text = f"📢 МАТЧ!\n🏟 {t1} vs {t2}\n⏰ Время: {time_val}\n\nДайте отпись: /Ready или /UnReady"
+    
     for uid in db["players"]:
         try:
-            await bot.send_message(int(uid), msg, parse_mode="Markdown")
-            count += 1
+            await context.bot.send_message(chat_id=int(uid), text=text)
         except: pass
-    await message.answer(f"✅ Сбор отправлен {count} игрокам.")
+        
+    await update.message.reply_text("✅ Сбор разослан!")
+    return ConversationHandler.END
 
-async def main():
-    print("Бот запущен и готов к работе!")
-    await dp.start_polling(bot)
+# --- ЗАПУСК ---
+def main():
+    app = Application.builder().token(TOKEN).build()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("Ready", ready))
+    app.add_handler(CommandHandler("UnReady", unready))
+    app.add_handler(CommandHandler("Admin", admin_panel))
+    app.add_handler(CommandHandler("add_club", add_club))
+    app.add_handler(CommandHandler("bind", bind))
+
+    match_conv = ConversationHandler(
+        entry_points=[CommandHandler("match", match_start)],
+        states={
+            TEAM1: [CallbackQueryHandler(team1_selected)],
+            TEAM2: [CallbackQueryHandler(team2_selected)],
+            TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, time_set)],
+        },
+        fallbacks=[],
+    )
+    app.add_handler(match_conv)
+
+    print("Бот запущен на библиотеке python-telegram-bot")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
